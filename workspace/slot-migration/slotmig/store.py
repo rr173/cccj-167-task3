@@ -289,6 +289,24 @@ class Store:
                 "SELECT * FROM plans ORDER BY created_at DESC").fetchall()
         return [self._row_to_plan(r) for r in rows]
 
+    def find_active_conflicts(self, *, source_cluster: str, source_slot: str,
+                              target_cluster: str, target_slot: str,
+                              consumer_group: str) -> list:
+        """Active (non-terminal) plans covering any of the given resources.
+
+        Read-only mirror of the clash check in create_plan() — used by the
+        precheck, which must report conflicts without creating anything.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM plans WHERE state NOT IN ('COMPLETED','ABORTED','REVOKED') AND ("
+                " (source_cluster=? AND source_slot=?) OR"
+                " (target_cluster=? AND target_slot=?) OR"
+                " consumer_group=? ) ORDER BY created_at, plan_id",
+                (source_cluster, source_slot, target_cluster, target_slot,
+                 consumer_group)).fetchall()
+        return [self._row_to_plan(r) for r in rows]
+
     def transition(self, plan_id: str, expect: tuple, new_state: str, **fields) -> Plan:
         """Guarded state transition (compare-and-swap on current state)."""
         unknown = set(fields) - UPDATABLE_FIELDS
@@ -433,6 +451,18 @@ class Store:
         if r is None:
             raise MigrationError(NOT_FOUND, f"consumer group '{group_id}' not found",
                                  http_status=404)
+        return {"group_id": r["group_id"], "cluster": r["cluster"], "slot": r["slot"],
+                "epoch": r["epoch"], "watermark": r["watermark"],
+                "updated_at": r["updated_at"]}
+
+    def find_group(self, group_id: str) -> dict | None:
+        """Read-only group lookup: None when the group does not exist (the
+        precheck must not create it, unlike ensure_group)."""
+        with self._lock:
+            r = self.conn.execute("SELECT * FROM groups WHERE group_id=?",
+                                  (group_id,)).fetchone()
+        if r is None:
+            return None
         return {"group_id": r["group_id"], "cluster": r["cluster"], "slot": r["slot"],
                 "epoch": r["epoch"], "watermark": r["watermark"],
                 "updated_at": r["updated_at"]}

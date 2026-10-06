@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import threading
 
+from . import precheck as precheck_mod
 from . import proof as proof_mod
 from .cluster import KIND_MARKER, KIND_ROW, KIND_SCHEMA
 from .common import (
@@ -535,6 +536,21 @@ class MigrationController:
                 "elapsed_seconds": status["elapsed_seconds"],
                 "deadline": status["deadline"]})
             return credential
+
+    # --------------------------------------------------------------- precheck
+    def precheck(self, spec: dict) -> dict:
+        """Read-only resource precheck for a candidate plan spec.
+
+        Given the source slot, target slot, consumer group and table set,
+        returns availability, conflicting objects (with the conflicting
+        plans' states), schema versions and the target tables that would
+        need cleanup. Never creates a plan and never touches slots, fences
+        or consumer watermarks; the same input over unchanged state always
+        returns the same report. Unknown clusters/slots, an empty table set
+        and non-empty target tables each fail with a clear error code.
+        """
+        with self._lock:
+            return precheck_mod.run_precheck(self.clusters, self.store, spec)
 
     # --------------------------------------------------------------- consumers
     def commit(self, group_id: str, cluster: str, slot: str, lsn: int,

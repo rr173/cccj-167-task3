@@ -53,11 +53,24 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"API: http://{HOST}:{PORT}  (source 已预置 200 订单 + 50 客户)")
 
+    banner("0. 提交前只读预检（可用性 / 冲突 / 模式版本 / 目标表清理）")
+    # 预检要求目标槽已存在（正式流程会在 freeze 时自动供应目标槽）
+    call("POST", "/clusters/target/slots", {"name": "app_slot_replica"})
+    spec = {"source_cluster": "source", "source_slot": "app_slot",
+            "target_cluster": "target", "target_slot": "app_slot_replica",
+            "tables": ["orders", "customers"], "consumer_group": "analytics"}
+    _, pre = call("POST", "/precheck", spec)
+    print(f"available={pre['available']}  "
+          f"blocking_reasons={pre['blocking_reasons'] or '无'}")
+    print(f"schema_versions={pre['schema_versions']}  "
+          f"tables_to_cleanup={pre['tables_to_cleanup'] or '无'}  "
+          f"conflicts={pre['conflicts'] or '无'}")
+    _, pre2 = call("POST", "/precheck", spec)
+    print(f"同一输入再次预检结果一致：{pre == pre2}（预检为只读，不产生任何状态）")
+    print(f"预检页面:  http://{HOST}:{PORT}/precheck.html")
+
     banner("1. 创建迁移计划并冻结（源位点 / 目标订阅 / 表集合 / 模式版本）")
-    _, plan = call("POST", "/plans", {
-        "source_cluster": "source", "source_slot": "app_slot",
-        "target_cluster": "target", "target_slot": "app_slot_replica",
-        "tables": ["orders", "customers"], "consumer_group": "analytics"})
+    _, plan = call("POST", "/plans", spec)
     pid = plan["plan_id"]
     _, plan = call("POST", f"/plans/{pid}/freeze")
     print(f"plan {pid}  frozen_lsn={plan['frozen_lsn']}  "

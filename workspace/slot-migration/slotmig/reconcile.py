@@ -208,7 +208,7 @@ def _slot_or_none(cluster, name):
 
 
 # --------------------------------------------------------------------- HTML
-_CSS = """
+CSS = """
 body{font-family:-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
 margin:0;background:#f4f6f8;color:#1c2733}
 header{background:#16222e;color:#fff;padding:18px 28px}
@@ -416,7 +416,7 @@ def render_html(report: dict) -> str:
 <html lang="zh"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="5">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>位点对账 · {html.escape(pid)}</title><style>{_CSS}</style></head>
+<title>位点对账 · {html.escape(pid)}</title><style>{CSS}</style></head>
 <body><header>
 <h1>位点对账 <span class="pill st-{plan['state']}">{plan['state']}</span></h1>
 <div class="sub">计划 <code>{html.escape(pid)}</code> · 第 {plan['attempt']} 次尝试 ·

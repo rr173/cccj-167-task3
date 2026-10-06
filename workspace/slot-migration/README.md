@@ -9,22 +9,68 @@ slotmig/
   cluster.py      集群模拟：复制日志(LSN)、槽、表、模式版本、写围栏、运行校验和
   store.py        控制器持久化状态（SQLite）：计划、事件、快照、LSN 映射、消费者组、证明
   controller.py   迁移状态机（核心）：freeze/start/catch-up/verify/cutover/revoke/retry/abort
+  precheck.py     提交计划前的只读资源预检 + 预检页面
   proof.py        切换证明与撤回凭证的生成及独立验证
   reconcile.py    位点对账报告 + HTML 页面（含观察期撤回资格）
   api.py          HTTP API（仅标准库）
-tests/            42 个端到端与边界场景测试
-demo.py           全流程演示（写入线程 + 消费者线程并发 + 观察期撤回）
+tests/            56 个端到端与边界场景测试
+demo.py           全流程演示（预检 + 写入线程 + 消费者线程并发 + 观察期撤回）
 ```
 
 ## 快速开始
 
 ```bash
 cd slot-migration
-python3 -m unittest discover -s tests   # 运行测试（42 个）
+python3 -m unittest discover -s tests   # 运行测试（56 个）
 python3 demo.py                          # 端到端演示
 python3 demo.py --serve                  # 演示后保持 API 运行（打开对账页面）
 python3 -m slotmig.api --port 8080       # 只启动 API 服务（含演示数据）
 ```
+
+## 提交前预检（只读）
+
+提交迁移计划前，运维先对候选规格做只读资源预检：
+`POST /precheck`（JSON）或打开预检页面 `GET /precheck.html`
+（表单 + 结果区，即计划页预检区）。
+
+```json
+→ POST /precheck
+{ "source_cluster": "source", "source_slot": "app_slot",
+  "target_cluster": "target", "target_slot": "app_slot_replica",
+  "consumer_group": "analytics", "tables": ["orders", "customers"] }
+
+← 200
+{ "available": true, "blocking_reasons": [],
+  "spec": { …归一化后的规格（consumer_group 缺省为 grp_<源槽>）… },
+  "schema_versions": {"orders": 1, "customers": 1},
+  "tables_to_cleanup": [],
+  "conflicts": [], "conflicting_plans": [],
+  "source":  { "cluster": "…", "slot": {…}, "current_lsn": 250 },
+  "target":  { "cluster": "…", "slot": {…},
+               "tables": [{"table": "orders", "rows": 0, "empty": true}] },
+  "consumer_group": { "group_id": "analytics", "exists": false,
+                      "binding_ok": true } }
+```
+
+* **返回内容**：可用性（`available`）、阻止原因码、冲突对象
+  （`conflicts`）、冲突计划及其状态（`conflicting_plans[].state`）、
+  模式版本（`schema_versions`）与需要清理的目标表（`tables_to_cleanup`）。
+* **冲突作为报告返回**（`available=false`，HTTP 仍为 200）：
+  `ACTIVE_PLAN_CONFLICT`（活动计划占用源槽/目标槽/消费者组）、
+  `SOURCE_SLOT_NOT_ACTIVE`、`GROUP_BOUND_ELSEWHERE`。
+* **明确错误**（各自独立、稳定错误码）：
+
+  | 情形 | HTTP | 错误码 |
+  |---|---|---|
+  | 未知集群 / 未知槽（源槽或目标槽） | 404 | `NOT_FOUND` |
+  | 缺字段 / 空表集合 | 400 | `BAD_REQUEST` |
+  | 目标表非空 | 409 | `TARGET_NOT_EMPTY`（`details.tables_to_cleanup` 列出需清理的表与行数） |
+
+* **只读保证**：预检不创建计划、不创建/修改槽、不加围栏、不推进消费者
+  水位、不创建消费者组；响应不含时间戳与随机 id，**同一输入在状态不变
+  时再次请求结果完全一致**。
+* 预检比正式流程略严格：目标槽必须已存在（正式流程会在 freeze 时自动
+  供应）；正式创建与迁移流程（`POST /plans` → … → cutover）不受影响。
 
 ## 状态机
 
@@ -206,6 +252,8 @@ epoch 步进 2→3、保留游标与内部字段一致、引用了切换证明�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| POST | `/precheck` | 提交前只读资源预检（可用性/冲突/模式版本/目标表清理） |
+| GET | `/precheck.html` | 预检页面（计划页预检区：候选规格表单 + 结果） |
 | POST | `/plans` | 创建计划（DRAFT） |
 | POST | `/plans/{id}/freeze` | 冻结规格 |
 | POST | `/plans/{id}/start` | 一致快照 + 打开增量流 |

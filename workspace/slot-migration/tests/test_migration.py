@@ -993,6 +993,209 @@ class ObservationRevocation(Base):
             os.unlink(path)
 
 
+class Precheck(Base):
+    """Read-only resource precheck before a plan is submitted."""
+
+    def setUp(self):
+        super().setUp()
+        # the precheck requires both slots to exist (the formal flow would
+        # auto-provision the target slot at freeze; the precheck is stricter)
+        self.target.create_slot("app_slot_replica")
+
+    def spec(self, **over):
+        s = {"source_cluster": "source", "source_slot": "app_slot",
+             "target_cluster": "target", "target_slot": "app_slot_replica",
+             "tables": ["orders"], "consumer_group": "analytics"}
+        s.update(over)
+        return s
+
+    # ------------------------------------------------------------- report
+    def test_available_clean_spec_and_deterministic(self):
+        r1 = self.ctl.precheck(self.spec())
+        self.assertTrue(r1["available"])
+        self.assertEqual(r1["blocking_reasons"], [])
+        self.assertEqual(r1["conflicts"], [])
+        self.assertEqual(r1["conflicting_plans"], [])
+        self.assertEqual(r1["tables_to_cleanup"], [])
+        self.assertEqual(r1["schema_versions"], {"orders": 1})
+        self.assertEqual(r1["spec"]["consumer_group"], "analytics")
+        self.assertEqual(r1["source"]["slot"]["status"], "ACTIVE")
+        self.assertEqual(r1["target"]["slot"]["name"], "app_slot_replica")
+        self.assertFalse(r1["consumer_group"]["exists"])
+        # the same input again yields exactly the same result
+        r2 = self.ctl.precheck(self.spec())
+        self.assertEqual(r1, r2)
+
+    def test_consumer_group_defaults_like_create_plan(self):
+        r = self.ctl.precheck(self.spec(consumer_group=None))
+        self.assertEqual(r["spec"]["consumer_group"], "grp_app_slot")
+
+    def test_read_only_no_side_effects(self):
+        slots_src = self.source.list_slots()
+        slots_tgt = self.target.list_slots()
+        self.ctl.precheck(self.spec())
+        self.ctl.precheck(self.spec())
+        # no plan, no consumer group, no slot/fence/watermark changes
+        self.assertEqual(self.store.list_plans(), [])
+        self.assertIsNone(self.store.find_group("analytics"))
+        self.assertEqual(self.source.list_slots(), slots_src)
+        self.assertEqual(self.target.list_slots(), slots_tgt)
+        self.assertEqual(self.source.fenced_tables(), [])
+        self.assertEqual(self.target.fenced_tables(), [])
+
+    def test_read_only_existing_watermark_untouched(self):
+        self.ctl.ensure_group("analytics", "source", "app_slot")
+        self.ctl.commit("analytics", "source", "app_slot", lsn=7, epoch=1)
+        r = self.ctl.precheck(self.spec())
+        self.assertTrue(r["available"])
+        self.assertTrue(r["consumer_group"]["exists"])
+        self.assertTrue(r["consumer_group"]["binding_ok"])
+        self.assertEqual(r["consumer_group"]["watermark"], 7)
+        g = self.ctl.get_group("analytics")
+        self.assertEqual((g["epoch"], g["watermark"]), (1, 7))
+
+    # -------------------------------------------------------------- errors
+    def test_unknown_cluster(self):
+        for key in ("source_cluster", "target_cluster"):
+            with self.assertRaises(MigrationError) as ctx:
+                self.ctl.precheck(self.spec(**{key: "nope"}))
+            self.assertEqual(ctx.exception.code, "NOT_FOUND")
+            self.assertEqual(ctx.exception.http_status, 404)
+            self.assertIn("unknown cluster", ctx.exception.message)
+
+    def test_unknown_slots(self):
+        for key in ("source_slot", "target_slot"):
+            with self.assertRaises(MigrationError) as ctx:
+                self.ctl.precheck(self.spec(**{key: "ghost"}))
+            self.assertEqual(ctx.exception.code, "NOT_FOUND")
+            self.assertEqual(ctx.exception.http_status, 404)
+
+    def test_empty_table_set(self):
+        for bad in ([], [""]):
+            with self.assertRaises(MigrationError) as ctx:
+                self.ctl.precheck(self.spec(tables=bad))
+            self.assertEqual(ctx.exception.code, "BAD_REQUEST")
+
+    def test_missing_fields(self):
+        with self.assertRaises(MigrationError) as ctx:
+            self.ctl.precheck({"source_cluster": "source"})
+        self.assertEqual(ctx.exception.code, "BAD_REQUEST")
+
+    def test_target_not_empty_lists_tables_to_cleanup(self):
+        self.target.write("orders", "junk-1", {"x": 1})
+        self.target.write("orders", "junk-2", {"x": 2})
+        with self.assertRaises(MigrationError) as ctx:
+            self.ctl.precheck(self.spec())
+        self.assertEqual(ctx.exception.code, "TARGET_NOT_EMPTY")
+        self.assertEqual(ctx.exception.http_status, 409)
+        self.assertEqual(ctx.exception.details["tables_to_cleanup"],
+                         [{"table": "orders", "rows": 2}])
+        # the cleanup advice is accurate: after cleaning, the precheck passes
+        self.target.delete("orders", "junk-1")
+        self.target.delete("orders", "junk-2")
+        self.assertTrue(self.ctl.precheck(self.spec())["available"])
+
+    # ------------------------------------------------------------ conflicts
+    def test_conflicting_active_plan_reported_with_state(self):
+        pid = self.make_plan()  # FROZEN: holds the slot, target slot and group
+        r = self.ctl.precheck(self.spec())
+        self.assertFalse(r["available"])
+        self.assertIn("ACTIVE_PLAN_CONFLICT", r["blocking_reasons"])
+        self.assertEqual(len(r["conflicting_plans"]), 1)
+        cp = r["conflicting_plans"][0]
+        self.assertEqual(cp["plan_id"], pid)
+        self.assertEqual(cp["state"], "FROZEN")
+        self.assertEqual(sorted(cp["covers"]),
+                         ["consumer_group", "source_slot", "target_slot"])
+        # a terminal plan no longer blocks
+        self.ctl.abort(pid)
+        self.assertTrue(self.ctl.precheck(self.spec())["available"])
+
+    def test_group_bound_elsewhere_reported(self):
+        self.source.create_slot("other_slot")
+        self.ctl.ensure_group("analytics", "source", "other_slot")
+        r = self.ctl.precheck(self.spec())
+        self.assertFalse(r["available"])
+        self.assertIn("GROUP_BOUND_ELSEWHERE", r["blocking_reasons"])
+        self.assertFalse(r["consumer_group"]["binding_ok"])
+        cg = [c for c in r["conflicts"] if c["type"] == "consumer_group"][0]
+        self.assertEqual(cg["bound_to"],
+                         {"cluster": "source", "slot": "other_slot"})
+
+    def test_source_slot_not_active_reported(self):
+        self.source.retire_slot("app_slot")
+        r = self.ctl.precheck(self.spec())
+        self.assertFalse(r["available"])
+        self.assertIn("SOURCE_SLOT_NOT_ACTIVE", r["blocking_reasons"])
+
+    # ------------------------------------------------------- flow unaffected
+    def test_formal_flow_unaffected_after_precheck(self):
+        self.assertTrue(self.ctl.precheck(self.spec())["available"])
+        pid = self.make_plan()
+        self.run_to_completed(pid)
+        self.assertEqual(self.ctl.get_plan(pid)["state"], "COMPLETED")
+        self.assert_tables_equal("orders")
+
+    # ------------------------------------------------------------------ HTTP
+    def test_http_precheck_and_page(self):
+        import json
+        import urllib.request
+        from urllib.error import HTTPError
+        from slotmig.api import create_server
+
+        server = create_server(self.ctl,
+                               {"source": self.source, "target": self.target},
+                               "127.0.0.1", 0)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def call(method, path, payload=None):
+                data = json.dumps(payload).encode() if payload is not None \
+                    else None
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}", data=data, method=method,
+                    headers={"Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(req) as resp:
+                        raw = resp.read().decode()
+                        ct = resp.headers["Content-Type"]
+                        return resp.status, (json.loads(raw)
+                                             if ct.startswith("application/json")
+                                             else raw)
+                except HTTPError as exc:
+                    return exc.code, json.loads(exc.read().decode())
+
+            status, r = call("POST", "/precheck", self.spec())
+            self.assertEqual(status, 200)
+            self.assertTrue(r["available"])
+            # deterministic over HTTP as well
+            self.assertEqual(call("POST", "/precheck", self.spec())[1], r)
+
+            status, err = call("POST", "/precheck", self.spec(source_slot="ghost"))
+            self.assertEqual((status, err["error"]), (404, "NOT_FOUND"))
+            status, err = call("POST", "/precheck", self.spec(tables=[]))
+            self.assertEqual((status, err["error"]), (400, "BAD_REQUEST"))
+
+            self.target.write("orders", "junk", {})
+            status, err = call("POST", "/precheck", self.spec())
+            self.assertEqual((status, err["error"]), (409, "TARGET_NOT_EMPTY"))
+            self.assertEqual(err["details"]["tables_to_cleanup"],
+                             [{"table": "orders", "rows": 1}])
+            self.target.delete("orders", "junk")
+
+            status, page = call("GET", "/precheck.html")
+            self.assertEqual(status, 200)
+            self.assertIn("迁移预检", page)
+            self.assertIn("/precheck", page)
+
+            # all of the above was read-only: still no plans, no group
+            self.assertEqual(self.store.list_plans(), [])
+            self.assertIsNone(self.store.find_group("analytics"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 def render_html_for(ctl, pid):
     from slotmig.reconcile import render_html
     return render_html(ctl.reconcile(pid))

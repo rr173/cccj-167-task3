@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .common import MigrationError
 from .controller import MigrationController
 from .cluster import Cluster
+from .precheck import render_page as render_precheck_page
 from .reconcile import render_html
 from .store import Store
 
@@ -37,7 +38,13 @@ def _routes(ctl, clusters):
         ("GET", re.compile(r"^/$"),
          lambda h, m: _json({
              "service": "logical-slot-migration",
-             "links": {"plans": "/plans", "clusters": "/clusters/{name}"}})),
+             "links": {"plans": "/plans", "precheck": "/precheck.html",
+                       "clusters": "/clusters/{name}"}})),
+
+        ("POST", re.compile(r"^/precheck$"),
+         lambda h, m: _json(ctl.precheck(body(h)))),
+        ("GET", re.compile(r"^/precheck\.html$"),
+         lambda h, m: _html(render_precheck_page())),
 
         ("GET", re.compile(r"^/plans$"),
          lambda h, m: _json({"plans": ctl.list_plans()})),
