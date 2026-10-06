@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .common import MigrationError
 from .controller import MigrationController
 from .cluster import Cluster
-from .reconcile import render_html
+from .reconcile import render_html, render_precheck_page
 from .store import Store
 
 
@@ -37,12 +37,17 @@ def _routes(ctl, clusters):
         ("GET", re.compile(r"^/$"),
          lambda h, m: _json({
              "service": "logical-slot-migration",
-             "links": {"plans": "/plans", "clusters": "/clusters/{name}"}})),
+             "links": {"plans": "/plans", "precheck": "/plans/precheck.html",
+                       "clusters": "/clusters/{name}"}})),
 
         ("GET", re.compile(r"^/plans$"),
          lambda h, m: _json({"plans": ctl.list_plans()})),
         ("POST", re.compile(r"^/plans$"),
          lambda h, m: _json(ctl.create_plan(body(h)), 201)),
+        ("POST", re.compile(r"^/plans/precheck$"),
+         lambda h, m: _json(ctl.precheck(body(h)))),
+        ("GET", re.compile(r"^/plans/precheck\.html$"),
+         lambda h, m: _html(render_precheck_page())),
         ("GET", re.compile(r"^/plans/(?P<pid>[^/]+)$"),
          lambda h, m: _json(ctl.get_plan(m.group("pid")))),
         ("POST", re.compile(r"^/plans/(?P<pid>[^/]+)/freeze$"),

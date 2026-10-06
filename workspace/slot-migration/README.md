@@ -2,25 +2,26 @@
 
 在不停止源集群写入的前提下，把一个逻辑复制槽（连同它的下游消费者）从源集群
 安全迁移到目标集群。控制器负责：**冻结迁移计划 → 建立一致快照 → 传输增量 →
-零停机校验 → 原子切换消费者 → 出具切换证明**。
+零停机校验 → 原子切换消费者 → 出具切换证明**。提交计划前可先做**只读资源预检**
+（可用性 / 冲突对象 / 模式版本 / 待清理目标表）。
 
 ```
 slotmig/
   cluster.py      集群模拟：复制日志(LSN)、槽、表、模式版本、写围栏、运行校验和
   store.py        控制器持久化状态（SQLite）：计划、事件、快照、LSN 映射、消费者组、证明
-  controller.py   迁移状态机（核心）：freeze/start/catch-up/verify/cutover/revoke/retry/abort
+  controller.py   迁移状态机（核心）：precheck/freeze/start/catch-up/verify/cutover/revoke/retry/abort
   proof.py        切换证明与撤回凭证的生成及独立验证
-  reconcile.py    位点对账报告 + HTML 页面（含观察期撤回资格）
+  reconcile.py    位点对账报告 + HTML 页面（含观察期撤回资格）+ 预检页面
   api.py          HTTP API（仅标准库）
-tests/            42 个端到端与边界场景测试
-demo.py           全流程演示（写入线程 + 消费者线程并发 + 观察期撤回）
+tests/            53 个端到端与边界场景测试
+demo.py           全流程演示（预检 + 写入线程 + 消费者线程并发 + 观察期撤回）
 ```
 
 ## 快速开始
 
 ```bash
 cd slot-migration
-python3 -m unittest discover -s tests   # 运行测试（42 个）
+python3 -m unittest discover -s tests   # 运行测试（53 个）
 python3 demo.py                          # 端到端演示
 python3 demo.py --serve                  # 演示后保持 API 运行（打开对账页面）
 python3 -m slotmig.api --port 8080       # 只启动 API 服务（含演示数据）
@@ -185,6 +186,32 @@ epoch 步进 2→3、保留游标与内部字段一致、引用了切换证明�
 无接管确认、源当时受保护、计划已撤回且链接一致、消费者组已恢复、库内哈希
 一致、切换证明哈希匹配、保留游标与切换锚点重算一致）。
 
+## 提交前预检（只读）
+
+`POST /plans/precheck` 在正式提交计划前做只读资源预检；`GET
+/plans/precheck.html` 是对应的表单页面（对账页头部也有入口）。输入与创建计划
+相同的规格（源槽、目标槽、消费者组、表集合），返回：
+
+* `available` —— 当前规格是否可立即提交（无任何冲突）；
+* `conflicts` —— 冲突对象列表：活动计划占用槽/订阅/消费者组
+  （`active_plan`）、源槽非 ACTIVE（`source_slot_not_active`）、消费者组已
+  绑定他处（`consumer_group_bound_elsewhere`）、源表被围栏（`table_fenced`）、
+  目标槽非 ACTIVE（`target_slot_not_active`）；
+* `conflicting_plans` —— 冲突计划的 id、**状态**与重叠对象（终态
+  COMPLETED/ABORTED/REVOKED 不占用资源；FAILED 仍占用，与正式创建一致）；
+* `schema_versions` —— 表集合在源集群的当前模式版本；
+* `tables_to_cleanup` —— 需要清理的目标表（正常为空；非空见下面的错误）。
+
+保证：
+
+* **只读**：不创建计划、不创建/修改槽、不加围栏、不动消费者水位；
+* **确定性**：响应不含时间戳与随机 id，同一输入在状态不变时结果完全一致；
+* **明确错误**：未知集群或槽 → `NOT_FOUND`(404)；空表集合 →
+  `BAD_REQUEST`(400)；目标表非空 → `TARGET_NOT_EMPTY`(409)，`details` 中附
+  `tables_to_cleanup` 清单（表 + 行数）；
+* 预检不影响正式流程：`POST /plans` 与迁移状态机行为不变（预检的冲突判定
+  与 `create_plan` 复用同一条查询）。
+
 ## 位点对账页面
 
 `GET /plans/{id}/reconcile.html`（5 秒自动刷新），JSON 版本在
@@ -206,6 +233,8 @@ epoch 步进 2→3、保留游标与内部字段一致、引用了切换证明�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| POST | `/plans/precheck` | 提交前只读资源预检（可用性/冲突/模式版本/待清理目标表） |
+| GET | `/plans/precheck.html` | 预检页面（表单 + 结果展示） |
 | POST | `/plans` | 创建计划（DRAFT） |
 | POST | `/plans/{id}/freeze` | 冻结规格 |
 | POST | `/plans/{id}/start` | 一致快照 + 打开增量流 |
@@ -225,7 +254,9 @@ epoch 步进 2→3、保留游标与内部字段一致、引用了切换证明�
 
 错误统一为 `{"error": 稳定错误码, "message": …, "details": …}`，如
 `STALE_EPOCH`、`WRITES_FENCED`、`SCHEMA_CHANGED`、`VERIFY_MISMATCH`、
-`TARGET_NOT_EMPTY`。撤回被拒绝时使用 `TAKEOVER_PROGRESSED`、
+`TARGET_NOT_EMPTY`。预检的输入错误使用 `NOT_FOUND`（未知集群/槽）、
+`BAD_REQUEST`（空表集合）、`TARGET_NOT_EMPTY`（目标表非空，details 附清理
+清单）。撤回被拒绝时使用 `TAKEOVER_PROGRESSED`、
 `SOURCE_NOT_PROTECTED`、`OBSERVATION_EXPIRED`（details 中附完整阻止条件、
 截止时间与剩余秒数）。
 

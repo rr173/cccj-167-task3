@@ -993,6 +993,214 @@ class ObservationRevocation(Base):
             os.unlink(path)
 
 
+class Precheck(Base):
+    """Read-only preflight check before submitting a plan."""
+    SPEC = {"source_cluster": "source", "source_slot": "app_slot",
+            "target_cluster": "target", "target_slot": "app_slot_replica",
+            "tables": ["orders"], "consumer_group": "analytics"}
+
+    def precheck(self, **over):
+        return self.ctl.precheck(dict(self.SPEC, **over))
+
+    def test_available_on_clean_spec(self):
+        r = self.precheck()
+        self.assertTrue(r["available"])
+        self.assertEqual(r["conflicts"], [])
+        self.assertEqual(r["conflicting_plans"], [])
+        self.assertEqual(r["tables_to_cleanup"], [])
+        self.assertEqual(r["schema_versions"], {"orders": 1})
+        self.assertEqual(r["spec"]["consumer_group"], "analytics")
+        self.assertEqual(r["source_slot"]["status"], "ACTIVE")
+        # target slot / consumer group do not exist yet — reported, not errors
+        self.assertIsNone(r["target_slot"])
+        self.assertIsNone(r["consumer_group"])
+        # consumer group defaults to grp_<source_slot>, like create_plan
+        r = self.precheck(consumer_group=None)
+        self.assertEqual(r["spec"]["consumer_group"], "grp_app_slot")
+
+    def test_read_only_and_deterministic(self):
+        before = {"plans": self.ctl.list_plans(),
+                  "source": self.source.status(),
+                  "target": self.target.status()}
+        r1 = self.precheck()
+        r2 = self.precheck()
+        self.assertEqual(r1, r2)  # same input → identical result
+        # nothing created or mutated: no plan, no slot, no fence, no watermark
+        self.assertEqual(self.ctl.list_plans(), before["plans"])
+        self.assertEqual(self.source.status(), before["source"])
+        self.assertEqual(self.target.status(), before["target"])
+        self.assertEqual(self.target.list_slots(), [])  # slot not provisioned
+        self.assertEqual(self.source.fenced_tables(), [])
+        with self.assertRaises(MigrationError):
+            self.ctl.get_group("analytics")  # group not created
+
+    def test_unknown_cluster_or_slot(self):
+        for over in ({"source_cluster": "nope"}, {"target_cluster": "nope"},
+                     {"source_slot": "missing_slot"}):
+            with self.assertRaises(MigrationError) as ctx:
+                self.precheck(**over)
+            self.assertEqual(ctx.exception.code, "NOT_FOUND")
+            self.assertEqual(ctx.exception.http_status, 404)
+
+    def test_empty_tables_rejected(self):
+        for tables in ([], [""]):
+            with self.assertRaises(MigrationError) as ctx:
+                self.precheck(tables=tables)
+            self.assertEqual(ctx.exception.code, "BAD_REQUEST")
+        with self.assertRaises(MigrationError) as ctx:
+            self.ctl.precheck({"source_cluster": "source"})  # missing fields
+        self.assertEqual(ctx.exception.code, "BAD_REQUEST")
+
+    def test_target_not_empty(self):
+        self.target.write("orders", "leftover", {"x": 1})
+        with self.assertRaises(MigrationError) as ctx:
+            self.precheck()
+        self.assertEqual(ctx.exception.code, "TARGET_NOT_EMPTY")
+        self.assertEqual(ctx.exception.http_status, 409)
+        self.assertEqual(ctx.exception.details["tables_to_cleanup"],
+                         [{"table": "orders", "rows": 1}])
+        # the failed precheck mutated nothing either
+        self.assertEqual(self.ctl.list_plans(), [])
+        # clearing the target table makes the same spec pass
+        self.target._tables["orders"] = {}
+        self.target._running["orders"] = 0
+        self.assertTrue(self.precheck()["available"])
+
+    def test_conflicting_active_plan_reported_with_state(self):
+        pid = self.make_plan()  # FROZEN, same slot/target/group as SPEC
+        r = self.precheck()
+        self.assertFalse(r["available"])
+        self.assertIn("active_plan", [c["kind"] for c in r["conflicts"]])
+        self.assertEqual(len(r["conflicting_plans"]), 1)
+        cp = r["conflicting_plans"][0]
+        self.assertEqual(cp["plan_id"], pid)
+        self.assertEqual(cp["state"], "FROZEN")
+        self.assertEqual(sorted(cp["overlaps"]),
+                         ["consumer_group", "source_slot", "target_slot"])
+        # aborting frees the resources: terminal plans do not conflict
+        self.ctl.abort(pid)
+        self.assertTrue(self.precheck()["available"])
+
+    def test_failed_plan_still_conflicts(self):
+        pid = self.make_plan()
+        # fail the plan before any snapshot load, so the target stays empty
+        # and the precheck reaches the conflict check
+        self.source.schema_change("orders", "add column")
+        with self.assertRaises(MigrationError) as ctx:
+            self.ctl.start(pid)
+        self.assertEqual(ctx.exception.code, "SCHEMA_CHANGED")
+        self.assertEqual(self.ctl.get_plan(pid)["state"], "FAILED")
+        # FAILED is non-terminal: the plan still holds its resources
+        r = self.precheck()
+        self.assertFalse(r["available"])
+        self.assertEqual(r["conflicting_plans"][0]["state"], "FAILED")
+
+    def test_group_bound_elsewhere_conflicts(self):
+        self.source.create_slot("other_slot")
+        self.ctl.ensure_group("analytics", "source", "other_slot")
+        r = self.precheck()
+        self.assertFalse(r["available"])
+        self.assertIn("consumer_group_bound_elsewhere",
+                      [c["kind"] for c in r["conflicts"]])
+
+    def test_fenced_table_and_inactive_slots_conflict(self):
+        self.source.fence_tables(["orders"], "plan:other:1")
+        r = self.precheck()
+        self.assertIn("table_fenced", [c["kind"] for c in r["conflicts"]])
+        self.source.unfence_tables(["orders"], "plan:other:1")
+
+        self.source.retire_slot("app_slot")
+        r = self.precheck()
+        self.assertIn("source_slot_not_active",
+                      [c["kind"] for c in r["conflicts"]])
+        self.source.activate_slot("app_slot")
+
+        self.target.create_slot("app_slot_replica")
+        self.target.retire_slot("app_slot_replica")
+        r = self.precheck()
+        self.assertFalse(r["available"])
+        self.assertIn("target_slot_not_active",
+                      [c["kind"] for c in r["conflicts"]])
+
+    def test_formal_flow_unaffected_after_precheck(self):
+        self.assertTrue(self.precheck()["available"])
+        pid = self.make_plan()
+        self.run_to_completed(pid)
+        self.assertEqual(self.ctl.get_plan(pid)["state"], "COMPLETED")
+        self.assert_tables_equal("orders")
+
+    def test_http_precheck(self):
+        import json
+        import urllib.request
+        from urllib.error import HTTPError
+        from slotmig.api import create_server
+
+        server = create_server(self.ctl,
+                               {"source": self.source, "target": self.target},
+                               "127.0.0.1", 0)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def call(method, path, payload=None):
+                data = json.dumps(payload).encode() if payload is not None \
+                    else None
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}", data=data, method=method,
+                    headers={"Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(req) as resp:
+                        raw = resp.read().decode()
+                        ct = resp.headers["Content-Type"]
+                        return resp.status, (json.loads(raw)
+                                             if ct.startswith("application/json")
+                                             else raw)
+                except HTTPError as exc:
+                    return exc.code, json.loads(exc.read().decode())
+
+            # clean spec → available; a repeat request is byte-identical
+            status, r1 = call("POST", "/plans/precheck", self.SPEC)
+            self.assertEqual(status, 200)
+            self.assertTrue(r1["available"])
+            status, r2 = call("POST", "/plans/precheck", self.SPEC)
+            self.assertEqual(r2, r1)
+            # …and it created nothing
+            status, plans = call("GET", "/plans")
+            self.assertEqual(plans["plans"], [])
+
+            # distinct, explicit errors
+            status, e = call("POST", "/plans/precheck",
+                             dict(self.SPEC, source_slot="nope"))
+            self.assertEqual((status, e["error"]), (404, "NOT_FOUND"))
+            status, e = call("POST", "/plans/precheck",
+                             dict(self.SPEC, tables=[]))
+            self.assertEqual((status, e["error"]), (400, "BAD_REQUEST"))
+
+            # the precheck page renders
+            status, page = call("GET", "/plans/precheck.html")
+            self.assertEqual(status, 200)
+            self.assertIn("预检", page)
+
+            # the formal flow is unaffected: create + migrate to completion
+            status, plan = call("POST", "/plans", self.SPEC)
+            self.assertEqual(status, 201)
+            pid = plan["plan_id"]
+            for step in ("freeze", "start", "catch-up", "verify", "cutover"):
+                status, _ = call("POST", f"/plans/{pid}/{step}")
+                self.assertEqual(status, 200, step)
+            self.assertEqual(call("GET", f"/plans/{pid}")[1]["state"],
+                             "COMPLETED")
+
+            # the migrated tables now sit on the target → explicit 409 with
+            # the cleanup list
+            status, e = call("POST", "/plans/precheck", self.SPEC)
+            self.assertEqual((status, e["error"]), (409, "TARGET_NOT_EMPTY"))
+            self.assertEqual(e["details"]["tables_to_cleanup"],
+                             [{"table": "orders", "rows": 50}])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 def render_html_for(ctl, pid):
     from slotmig.reconcile import render_html
     return render_html(ctl.reconcile(pid))

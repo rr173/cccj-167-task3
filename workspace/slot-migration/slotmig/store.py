@@ -245,24 +245,37 @@ class Store:
             created_at=d["created_at"], updated_at=d["updated_at"],
         )
 
+    def active_plans_covering(self, source_cluster: str, source_slot: str,
+                              target_cluster: str, target_slot: str,
+                              consumer_group: str) -> list:
+        """Active (non-terminal) plans clashing with the given spec — the
+        read-only twin of the conflict check in create_plan(), used by the
+        preflight check. Terminal plans (COMPLETED/ABORTED/REVOKED) hold no
+        resources; FAILED plans still block until aborted."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM plans WHERE state NOT IN ('COMPLETED','ABORTED','REVOKED') AND ("
+                " (source_cluster=? AND source_slot=?) OR"
+                " (target_cluster=? AND target_slot=?) OR"
+                " consumer_group=? ) ORDER BY created_at DESC, plan_id",
+                (source_cluster, source_slot, target_cluster, target_slot,
+                 consumer_group)).fetchall()
+        return [self._row_to_plan(r) for r in rows]
+
     def create_plan(self, spec: dict) -> Plan:
         plan_id = new_id("plan")
         now = now_iso()
         observation_seconds = int(spec.get("observation_seconds",
                                            DEFAULT_OBSERVATION_SECONDS))
         with self._lock, self.conn:
-            clash = self.conn.execute(
-                "SELECT plan_id FROM plans WHERE state NOT IN ('COMPLETED','ABORTED','REVOKED') AND ("
-                " (source_cluster=? AND source_slot=?) OR"
-                " (target_cluster=? AND target_slot=?) OR"
-                " consumer_group=? )",
-                (spec["source_cluster"], spec["source_slot"],
-                 spec["target_cluster"], spec["target_slot"],
-                 spec["consumer_group"])).fetchone()
-            if clash:
+            clashes = self.active_plans_covering(
+                spec["source_cluster"], spec["source_slot"],
+                spec["target_cluster"], spec["target_slot"],
+                spec["consumer_group"])
+            if clashes:
                 raise MigrationError(
                     CONFLICT,
-                    f"an active plan ({clash['plan_id']}) already covers this slot, "
+                    f"an active plan ({clashes[0].plan_id}) already covers this slot, "
                     f"target subscription or consumer group",
                     http_status=409)
             self.conn.execute(

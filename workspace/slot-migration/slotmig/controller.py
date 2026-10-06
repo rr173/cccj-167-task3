@@ -41,6 +41,7 @@ from .common import (
     SOURCE_NOT_PROTECTED,
     STALE_EPOCH,
     TAKEOVER_PROGRESSED,
+    TARGET_NOT_EMPTY,
     VERIFY_MISMATCH,
     MigrationError,
     canonical_json,
@@ -104,6 +105,149 @@ class MigrationController:
 
     def list_plans(self) -> list:
         return [p.to_dict() for p in self.store.list_plans()]
+
+    # --------------------------------------------------------------- precheck
+    def precheck(self, spec: dict) -> dict:
+        """Read-only resource precheck for a would-be plan (提交前预检).
+
+        Given the source slot, target slot, consumer group and table set,
+        reports availability, conflicting objects, the states of conflicting
+        plans, current schema versions and the target tables needing cleanup.
+        It never creates plans, provisions slots, fences tables or touches
+        consumer watermarks, and its report carries no timestamps or ids —
+        the same input against unchanged state always returns the same
+        result.
+
+        Hard failures mirror the formal flow: unknown cluster/slot →
+        NOT_FOUND, empty table set → BAD_REQUEST, non-empty target tables →
+        TARGET_NOT_EMPTY (the cleanup list rides in the error details).
+        """
+        with self._lock:
+            for key in ("source_cluster", "source_slot", "target_cluster",
+                        "target_slot", "tables"):
+                if not spec.get(key):
+                    raise MigrationError(BAD_REQUEST, f"missing field: {key}")
+            for c in (spec["source_cluster"], spec["target_cluster"]):
+                if c not in self.clusters:
+                    raise MigrationError(NOT_FOUND, f"unknown cluster '{c}'",
+                                         http_status=404)
+            tables = sorted({t for t in spec["tables"]
+                             if isinstance(t, str) and t})
+            if not tables:
+                raise MigrationError(BAD_REQUEST,
+                                     "tables must be a non-empty list")
+            source = self.clusters[spec["source_cluster"]]
+            target = self.clusters[spec["target_cluster"]]
+            group_id = spec.get("consumer_group") or f"grp_{spec['source_slot']}"
+
+            source_slot = source.get_slot(spec["source_slot"])  # 404 if missing
+            try:
+                target_slot = target.get_slot(spec["target_slot"])
+            except MigrationError:
+                target_slot = None  # freeze provisions it on demand — not an error
+
+            non_empty = {t: target.table_count(t) for t in tables
+                         if target.table_count(t)}
+            if non_empty:
+                raise MigrationError(
+                    TARGET_NOT_EMPTY,
+                    "target tables are not empty; clear them before submitting "
+                    "the plan (a first attempt refuses to load into them)",
+                    {"target_cluster": spec["target_cluster"],
+                     "tables_to_cleanup": [
+                         {"table": t, "rows": n}
+                         for t, n in sorted(non_empty.items())]},
+                    http_status=409)
+
+            conflicts, conflicting_plans = [], []
+            for p in self.store.active_plans_covering(
+                    spec["source_cluster"], spec["source_slot"],
+                    spec["target_cluster"], spec["target_slot"], group_id):
+                overlaps = []
+                if (p.source_cluster, p.source_slot) == \
+                        (spec["source_cluster"], spec["source_slot"]):
+                    overlaps.append("source_slot")
+                if (p.target_cluster, p.target_slot) == \
+                        (spec["target_cluster"], spec["target_slot"]):
+                    overlaps.append("target_slot")
+                if p.consumer_group == group_id:
+                    overlaps.append("consumer_group")
+                conflicting_plans.append({
+                    "plan_id": p.plan_id, "state": p.state, "attempt": p.attempt,
+                    "overlaps": overlaps,
+                    "source_cluster": p.source_cluster,
+                    "source_slot": p.source_slot,
+                    "target_cluster": p.target_cluster,
+                    "target_slot": p.target_slot,
+                    "consumer_group": p.consumer_group,
+                })
+                conflicts.append({
+                    "kind": "active_plan",
+                    "objects": overlaps,
+                    "detail": f"active plan {p.plan_id} ({p.state}) already "
+                              f"covers {', '.join(overlaps)}",
+                    "plan_id": p.plan_id, "state": p.state,
+                })
+
+            if source_slot["status"] != "ACTIVE":
+                conflicts.append({
+                    "kind": "source_slot_not_active",
+                    "objects": ["source_slot"],
+                    "detail": f"source slot '{spec['source_slot']}' is "
+                              f"{source_slot['status']}; freeze requires ACTIVE",
+                })
+
+            group = None
+            try:
+                group = self.store.get_group(group_id)
+            except MigrationError:
+                pass  # group not created yet — freeze will bind it
+            if group is not None and (group["cluster"], group["slot"]) != \
+                    (spec["source_cluster"], spec["source_slot"]):
+                conflicts.append({
+                    "kind": "consumer_group_bound_elsewhere",
+                    "objects": ["consumer_group"],
+                    "detail": f"consumer group '{group_id}' is bound to "
+                              f"{group['cluster']}/{group['slot']}, not the "
+                              f"plan's source slot",
+                })
+
+            for t in tables:
+                token = source.fence_token_for(t)
+                if token is not None:
+                    conflicts.append({
+                        "kind": "table_fenced",
+                        "objects": [t],
+                        "detail": f"source table '{t}' is fenced by {token}; "
+                                  f"cutover cannot fence it until released",
+                        "table": t, "fence_token": token,
+                    })
+
+            if target_slot is not None and target_slot["status"] != "ACTIVE":
+                conflicts.append({
+                    "kind": "target_slot_not_active",
+                    "objects": ["target_slot"],
+                    "detail": f"target slot '{spec['target_slot']}' is "
+                              f"{target_slot['status']}; consumers could not "
+                              f"read from it after cutover",
+                })
+
+            return {
+                "available": not conflicts,
+                "spec": {"source_cluster": spec["source_cluster"],
+                         "source_slot": spec["source_slot"],
+                         "target_cluster": spec["target_cluster"],
+                         "target_slot": spec["target_slot"],
+                         "consumer_group": group_id,
+                         "tables": tables},
+                "conflicts": conflicts,
+                "conflicting_plans": conflicting_plans,
+                "schema_versions": source.schema_versions(tables),
+                "tables_to_cleanup": [],
+                "source_slot": source_slot,
+                "target_slot": target_slot,
+                "consumer_group": group,
+            }
 
     def freeze(self, plan_id: str) -> dict:
         """Pin the plan: source position, schema versions, target subscription,

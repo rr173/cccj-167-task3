@@ -260,6 +260,138 @@ def _esc(v):
     return html.escape("—" if v is None else str(v))
 
 
+# ------------------------------------------------------------- precheck page
+def render_precheck_page() -> str:
+    """Static precheck console (计划页预检区): a form that posts a would-be
+    plan spec to POST /plans/precheck and renders the read-only report."""
+    return _PRECHECK_HEAD + _CSS + _PRECHECK_BODY
+
+
+_PRECHECK_HEAD = """<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>迁移预检 · 只读资源检查</title><style>"""
+
+_PRECHECK_BODY = """
+label{display:block;margin:10px 0 3px;font-size:13px;color:#33475b;font-weight:600}
+input{width:300px;padding:6px 8px;border:1px solid #ced4da;border-radius:6px;font-size:13px}
+button{margin-top:14px;padding:8px 20px;border:0;border-radius:6px;background:#1971c2;
+color:#fff;font-size:14px;cursor:pointer}
+button:hover{background:#1864ab}
+.grid{display:flex;flex-wrap:wrap;gap:2px 30px}
+h3{font-size:13.5px;color:#33475b;margin:16px 0 8px}
+</style></head>
+<body><header>
+<h1>迁移预检 <span class="pill st-FROZEN">只读</span></h1>
+<div class="sub">提交迁移计划前的资源预检：不创建计划、不创建/修改槽、不加围栏、
+不动消费者水位；同一输入在状态不变时结果完全一致。</div>
+</header><main>
+<section><h2>预检输入</h2>
+<div class="grid">
+<div><label>源集群</label><input id="source_cluster" value="source"></div>
+<div><label>源槽</label><input id="source_slot" value="app_slot"></div>
+<div><label>目标集群</label><input id="target_cluster" value="target"></div>
+<div><label>目标槽（订阅）</label><input id="target_slot" value="app_slot_replica"></div>
+<div><label>消费者组（留空默认 grp_&lt;源槽&gt;）</label>
+<input id="consumer_group" value="analytics"></div>
+<div><label>表集合（逗号分隔）</label>
+<input id="tables" value="orders, customers" style="width:340px"></div>
+</div>
+<button id="run">运行预检</button>
+<span id="msg" class="muted" style="margin-left:12px"></span>
+</section>
+<section id="out" style="display:none"><h2>预检结果</h2><div id="out-body"></div></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function run() {
+  const payload = {
+    source_cluster: $('source_cluster').value.trim(),
+    source_slot: $('source_slot').value.trim(),
+    target_cluster: $('target_cluster').value.trim(),
+    target_slot: $('target_slot').value.trim(),
+    tables: $('tables').value.split(',').map(s => s.trim()).filter(Boolean),
+  };
+  const grp = $('consumer_group').value.trim();
+  if (grp) payload.consumer_group = grp;
+  $('msg').textContent = '检查中…';
+  let status, data;
+  try {
+    const resp = await fetch('/plans/precheck', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)});
+    status = resp.status; data = await resp.json();
+  } catch (e) { $('msg').textContent = '请求失败：' + e; return; }
+  $('msg').textContent = '';
+  $('out').style.display = 'block';
+  $('out-body').innerHTML = (status === 200) ? report(data) : failure(status, data);
+}
+
+function failure(status, e) {
+  let h = '<p><span class="badge-warn">预检未通过 · HTTP ' + status + '</span></p>'
+    + '<p class="bad">' + esc(e.error || 'ERROR') + '：' + esc(e.message || '') + '</p>';
+  const tc = e.details && e.details.tables_to_cleanup;
+  if (tc && tc.length) {
+    h += '<h3>需要清理的目标表</h3><table><tr><th>表</th><th class="num">行数</th></tr>'
+      + tc.map(r => '<tr><td><code>' + esc(r.table) + '</code></td>'
+        + '<td class="num">' + r.rows + '</td></tr>').join('') + '</table>'
+      + '<p class="muted">清空后重新预检；正式迁移的首次快照也会拒绝写入非空目标表。</p>';
+  }
+  return h;
+}
+
+function report(r) {
+  let h = '<p>' + (r.available
+      ? '<span class="badge-ok">可提交计划</span>'
+      : '<span class="badge-warn">存在冲突，暂不可提交</span>')
+    + '　<span class="muted">消费者组 <code>' + esc(r.spec.consumer_group)
+    + '</code> · 表集合 <code>' + esc(r.spec.tables.join(', ')) + '</code></span></p>';
+  if (r.conflicts.length) {
+    h += '<h3>冲突对象</h3><table><tr><th>类型</th><th>对象</th><th>说明</th></tr>'
+      + r.conflicts.map(c => '<tr><td><code>' + esc(c.kind) + '</code></td><td>'
+        + esc((c.objects || []).join(', ')) + '</td><td>' + esc(c.detail)
+        + '</td></tr>').join('') + '</table>';
+  } else {
+    h += '<p class="ok">无冲突对象。</p>';
+  }
+  if (r.conflicting_plans.length) {
+    h += '<h3>冲突计划状态</h3><table><tr><th>计划</th><th>状态</th>'
+      + '<th class="num">尝试</th><th>重叠对象</th></tr>'
+      + r.conflicting_plans.map(p => '<tr><td><code>' + esc(p.plan_id)
+        + '</code></td><td><span class="pill st-' + esc(p.state) + '">'
+        + esc(p.state) + '</span></td><td class="num">' + p.attempt + '</td><td>'
+        + esc(p.overlaps.join(', ')) + '</td></tr>').join('') + '</table>';
+  }
+  h += '<h3>模式版本（源集群当前值）</h3><p><code class="mono">'
+    + esc(JSON.stringify(r.schema_versions)) + '</code></p>';
+  h += '<h3>需要清理的目标表</h3><p class="ok">无 —— 目标表均为空。</p>';
+  h += '<h3>槽与消费者组现状</h3><table><tr><th>对象</th><th>状态</th></tr>'
+    + '<tr><td>源槽 <code>' + esc(r.spec.source_slot) + '</code></td><td>'
+    + esc(r.source_slot.status) + '（确认位点 ' + r.source_slot.confirmed_lsn
+    + '）</td></tr>'
+    + '<tr><td>目标槽 <code>' + esc(r.spec.target_slot) + '</code></td><td>'
+    + (r.target_slot ? esc(r.target_slot.status) : '尚不存在（freeze 时自动创建）')
+    + '</td></tr>'
+    + '<tr><td>消费者组 <code>' + esc(r.spec.consumer_group) + '</code></td><td>'
+    + (r.consumer_group
+       ? '绑定 ' + esc(r.consumer_group.cluster) + '/'
+         + esc(r.consumer_group.slot) + ' · epoch ' + r.consumer_group.epoch
+         + ' · 水位 ' + r.consumer_group.watermark
+       : '尚未创建（freeze 时绑定到源槽）')
+    + '</td></tr></table>';
+  h += '<p class="muted">预检为只读操作，可安全重复调用；'
+    + '正式提交请使用 <code>POST /plans</code>。</p>';
+  return h;
+}
+
+$('run').addEventListener('click', run);
+</script>
+</body></html>"""
+
+
 def render_html(report: dict) -> str:
     plan = report["plan"]
     pos = report["positions"]
@@ -421,7 +553,8 @@ def render_html(report: dict) -> str:
 <h1>位点对账 <span class="pill st-{plan['state']}">{plan['state']}</span></h1>
 <div class="sub">计划 <code>{html.escape(pid)}</code> · 第 {plan['attempt']} 次尝试 ·
 生成于 {html.escape(report['generated_at'])}（每 5 秒自动刷新）·
-<a style="color:#9ecbff" href="/plans/{pid}/reconcile">JSON</a></div>
+<a style="color:#9ecbff" href="/plans/{pid}/reconcile">JSON</a> ·
+<a style="color:#9ecbff" href="/plans/precheck.html">预检</a></div>
 </header><main>
 <section><h2>迁移计划（冻结规格）</h2>
 <table>
